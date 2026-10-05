@@ -1,0 +1,30 @@
+# dav-remount config — lives at ~/.config/dav-remount/config
+# No secrets here. The access token goes in the Keychain: `dav-remount set-token`.
+
+# WebDAV share URL (https). The last path component becomes the volume name in /Volumes.
+url = https://dav.example.com/share
+
+# Username the server expects for HTTP Basic (often your sign-in email).
+user = you@example.com
+
+# ---- reachability gate: no mount attempt unless the server answers ----------
+# Host/port to probe before mounting (default: the URL's host and port).
+#reach_host = dav.example.com
+#reach_port = 443
+# Seconds to wait for the TCP connect.
+#reach_timeout = 3
+# If set, the resolved address must start with this prefix, otherwise the agent
+# treats the server as unreachable (catches "VPN down but public DNS answered").
+#expect_ip_prefix = 10.0.
+
+# ---- behaviour ----------------------------------------------------------------
+# After wake/network change, keep retrying for this many seconds.
+#retry_window = 120
+# Health-check interval while mounted (min 30). While unmounted it polls every 30 s.
+#poll_interval = 300
+# Cleanly eject before sleep so there is never a dead mount after wake.
+#unmount_on_sleep = true
+# Seconds a directory listing may take before the mount is declared dead.
+#probe_timeout = 8
+# Log file.
+#log = ~/Library/Logs/dav-remount.log
