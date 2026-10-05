@@ -1,7 +1,8 @@
 # dav-remount config — lives at ~/.config/dav-remount/config
 # No secrets here. The access token goes in the Keychain: `dav-remount set-token`.
 
-# WebDAV share URL (https). The last path component becomes the volume name in /Volumes.
+# WebDAV share URL (https). The volume in /Volumes is named after the last path
+# component, or after the host when the share is served at the root (…/).
 url = https://dav.example.com/share
 
 # Username the server expects for HTTP Basic (often your sign-in email).

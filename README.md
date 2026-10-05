@@ -100,6 +100,10 @@ launchctl bootout      gui/$(id -u)/dev.dav-remount.agent
   changed, so the Keychain asks once whether the new binary may read the item.
   Click Always Allow. Avoid this by installing a release binary rather than
   rebuilding.
+- **Volume name** — the last path component of the URL, or the host name when
+  the share is served at the root (`https://dav.example.com/` →
+  `/Volumes/dav.example.com`). Get the path right: a URL whose first listing
+  returns 404 fails with `rc=19 (Operation not supported by device)`.
 - **Volume mounted at `/Volumes/share-1`** — something else holds
   `/Volumes/share`. The agent tracks the volume by its server URL, not its
   path, so this is harmless.
