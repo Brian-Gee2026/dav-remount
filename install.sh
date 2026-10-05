@@ -22,6 +22,7 @@ fi
 mkdir -p "$HOME/.local/bin" "$CFG_DIR" "$HOME/Library/LaunchAgents" "$HOME/Library/Logs"
 chmod 700 "$CFG_DIR"
 install -m 755 "$BIN_SRC" "$BIN"
+xattr -d com.apple.quarantine "$BIN" 2>/dev/null || true   # a browser-downloaded release binary carries it
 echo "installed $BIN ($("$BIN" --version))"
 
 if [[ ! -f "$CFG" ]]; then
