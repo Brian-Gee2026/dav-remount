@@ -29,8 +29,10 @@ if [[ ! -f "$CFG" ]]; then
   if [[ -t 0 ]]; then
     read -rp "WebDAV share URL (https://host/share): " url
     read -rp "Username (as the server expects it, usually your email): " user
-    # keep the commented defaults, set the two required keys
+    read -rp "Volume name shown in Finder (blank = server default): " vol
+    # keep the commented defaults, set the required keys
     sed -i '' -e "s|^url = .*|url = $url|" -e "s|^user = .*|user = $user|" "$CFG"
+    [[ -n "$vol" ]] && sed -i '' -e "s|^#volume_name = .*|volume_name = $vol|" "$CFG"
   else
     echo "wrote $CFG from config.example — EDIT url= and user= then re-run" >&2; exit 1
   fi

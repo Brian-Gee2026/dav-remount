@@ -100,10 +100,17 @@ launchctl bootout      gui/$(id -u)/dev.dav-remount.agent
   changed, so the Keychain asks once whether the new binary may read the item.
   Click Always Allow. Avoid this by installing a release binary rather than
   rebuilding.
-- **Volume name** — the last path component of the URL, or the host name when
-  the share is served at the root (`https://dav.example.com/` →
-  `/Volumes/dav.example.com`). Get the path right: a URL whose first listing
-  returns 404 fails with `rc=19 (Operation not supported by device)`.
+- **Volume name** — by default the last path component of the URL, or the host
+  name when the share is served at the root (`https://dav.example.com/` →
+  `/Volumes/dav.example.com`). Set `volume_name = Share` to get `Share` in the
+  sidebar instead; the volume then mounts at `~/Volumes/Share` (`/Volumes`
+  itself is root-owned and macOS refuses mount points under `~/Library`), or
+  wherever `mount_dir` points. While unmounted that directory is an empty
+  folder; the agent refuses to mount over local files placed there.
+- **Custom icon** — drop a `.VolumeIcon.icns` in the share root on the server;
+  every client that mounts it gets the icon.
+- **`rc=19 (Operation not supported by device)`** — the URL path is wrong: the
+  client's first listing returned 404. Check the share path.
 - **Volume mounted at `/Volumes/share-1`** — something else holds
   `/Volumes/share`. The agent tracks the volume by its server URL, not its
   path, so this is harmless.

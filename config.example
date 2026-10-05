@@ -8,6 +8,13 @@ url = https://dav.example.com/share
 # Username the server expects for HTTP Basic (often your sign-in email).
 user = you@example.com
 
+# Name shown in Finder's sidebar. Finder names a WebDAV volume after its mount
+# directory, so a custom name mounts at ~/Volumes/<name> (or `mount_dir`; a dir under
+# your home — macOS refuses ~/Library, and /Volumes is root-owned).
+# Leave unset to get the server default (host name, or the URL's last path part).
+#volume_name = Share
+#mount_dir = ~/Volumes/Share
+
 # ---- reachability gate: no mount attempt unless the server answers ----------
 # Host/port to probe before mounting (default: the URL's host and port).
 #reach_host = dav.example.com

@@ -27,7 +27,7 @@ import Network
 import IOKit
 import IOKit.pwr_mgt
 
-let VERSION = "0.1.0"
+let VERSION = "0.2.0"
 
 // MARK: - Config -------------------------------------------------------------
 
@@ -43,6 +43,10 @@ struct Config {
     var unmountOnSleep = true
     var probeTimeout: TimeInterval = 8
     var logPath: String = NSHomeDirectory() + "/Library/Logs/dav-remount.log"
+    /// Finder shows the volume under the mount directory's name, so a custom
+    /// name means a custom mount point (default ~/Volumes/<name>; ~/Library is refused by macOS).
+    var volumeName: String? = nil
+    var mountDir: String? = nil
 
     static var dir: String { NSHomeDirectory() + "/.config/dav-remount" }
     /// DAV_REMOUNT_CONFIG overrides the path (tests, second shares).
@@ -88,6 +92,13 @@ struct Config {
         if let v = kv["unmount_on_sleep"] { c.unmountOnSleep = !["0", "false", "no"].contains(v.lowercased()) }
         if let v = kv["probe_timeout"], let d = TimeInterval(v) { c.probeTimeout = d }
         if let v = kv["log"], !v.isEmpty { c.logPath = expand(v) }
+        if let v = kv["volume_name"], !v.isEmpty {
+            guard !v.contains("/") else { throw CLIError("config: `volume_name` may not contain /") }
+            c.volumeName = v
+        }
+        if let v = kv["mount_dir"], !v.isEmpty { c.mountDir = expand(v) }
+        if c.mountDir == nil, let n = c.volumeName { c.mountDir = NSHomeDirectory() + "/Volumes/" + n }
+        if let d = c.mountDir, d == "/" || d == NSHomeDirectory() { throw CLIError("config: `mount_dir` must be a dedicated empty directory") }
         return c
     }
 }
@@ -335,14 +346,32 @@ func mountShare(_ cfg: Config, token: String) -> MountOutcome {
     open[kNAUIOptionKey] = kNAUIOptionNoUI          // never pop a dialog
     let mopts = NSMutableDictionary()
     mopts[kNetFSSoftMountKey] = true                 // fail fast instead of hanging
+    var mountpath: CFURL? = nil
+    if let dir = cfg.mountDir {
+        do {
+            try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        } catch {
+            Log.line("mount", "cannot create mount dir \(dir): \(error.localizedDescription)")
+            return .failed(EIO)
+        }
+        if let n = try? FileManager.default.contentsOfDirectory(atPath: dir), !n.filter({ $0 != ".DS_Store" }).isEmpty {
+            Log.line("mount", "mount dir \(dir) is not empty — refusing to mount over local files")
+            return .failed(ENOTEMPTY)
+        }
+        mountpath = URL(fileURLWithPath: dir) as CFURL
+        mopts[kNetFSMountAtMountDirKey] = true       // mount AT the dir, not in a subdir of it
+    }
     var mountpoints: Unmanaged<CFArray>? = nil
-    let rc = NetFSMountURLSync(cfg.url as CFURL, nil, cfg.user as CFString, token as CFString,
+    let rc = NetFSMountURLSync(cfg.url as CFURL, mountpath, cfg.user as CFString, token as CFString,
                                open, mopts, &mountpoints)
     if rc == 0 || rc == EEXIST {
         let arr = mountpoints?.takeRetainedValue() as? [String]
         return .mounted(arr?.first ?? findMount(cfg)?.path ?? "?")
     }
-    if rc == EACCES || rc == EAUTH || rc == EPERM { return .authFailed(rc) }
+    if rc == EACCES || rc == EAUTH { return .authFailed(rc) }
+    if rc == EPERM {
+        Log.line("mount", "mount refused (EPERM) — macOS will not mount at \(cfg.mountDir ?? "?"); use a mount_dir under your home such as ~/Volumes/<name>")
+    }
     return .failed(rc)
 }
 
@@ -394,6 +423,14 @@ final class Agent {
             Log.state("paused", reason, "paused until \(p) — skipping")
             armTimer(30)
             return false
+        }
+        if let m = findMount(cfg), let want = cfg.mountDir, m.path != want {
+            Log.line(reason, "mounted at \(m.path) but config wants \(want) — moving")
+            if !(unmountVolume(m.path, force: false) || unmountVolume(m.path, force: true)) {
+                Log.line(reason, "could not unmount \(m.path) to move it — will retry next pass")
+                armTimer(30)
+                return false
+            }
         }
         if let m = findMount(cfg) {
             switch probe(m.path, timeout: cfg.probeTimeout) {
@@ -584,6 +621,7 @@ func main() -> Int32 {
         out("config:    \(Config.path)")
         out("share:     \(cfg.url.absoluteString)")
         out("user:      \(cfg.user)")
+        if let n = cfg.volumeName { out("volume:    \(n)  (mount dir \(cfg.mountDir ?? "-"))") }
         out("token:     \(Keychain.exists(cfg) ? "present in Keychain" : "MISSING — run `dav-remount set-token`")")
         out("reach:     \(checkReach(cfg).text)")
         if let p = Pause.until() { out("paused:    until \(p)") }
