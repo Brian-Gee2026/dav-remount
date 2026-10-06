@@ -28,7 +28,7 @@ import Network
 import IOKit
 import IOKit.pwr_mgt
 
-let VERSION = "0.3.2"
+let VERSION = "0.3.4"
 
 // MARK: - Config -------------------------------------------------------------
 
@@ -42,7 +42,7 @@ struct Config {
     var retryWindow: TimeInterval = 120
     var pollInterval: TimeInterval = 300
     var unmountOnSleep = true
-    var probeTimeout: TimeInterval = 8
+    var probeTimeout: TimeInterval = 15
     var logPath: String = NSHomeDirectory() + "/Library/Logs/dav-remount.log"
     /// Finder shows the volume under the mount directory's name, so a custom
     /// name means a custom mount point (default ~/Volumes/<name>; ~/Library is refused by macOS).
@@ -263,17 +263,40 @@ func findMount(_ cfg: Config) -> MountInfo? {
     }
 }
 
-/// Lists the volume root in a side thread. nil = hung past the timeout
-/// (the dead-after-sleep case), false = error, true = alive.
+/// Reads the volume root in a side thread with a plain opendir/readdir — on
+/// webdavfs that is ONE PROPFIND, whereas an attribute walk fetches every
+/// entry's sidecar metadata (one round trip each, slow on a cold cache over a
+/// tunnel). nil = hung past the timeout (the dead-after-sleep case), false =
+/// error, true = alive.
 func probe(_ path: String, timeout: TimeInterval) -> Bool? {
     let sem = DispatchSemaphore(value: 0)
     let box = ResultBox()
     let t = Thread {
-        box.value = (try? FileManager.default.contentsOfDirectory(atPath: path)) != nil
+        if let d = opendir(path) {
+            box.value = readdir(d) != nil
+            closedir(d)
+        }
         sem.signal()
     }
     t.start()
     return sem.wait(timeout: .now() + timeout) == .success ? box.value : nil
+}
+
+/// Runs a command with a hard deadline; true on exit 0 within the deadline.
+func runBounded(_ exe: String, _ args: [String], seconds: TimeInterval) -> Bool {
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: exe)
+    p.arguments = args
+    p.standardOutput = FileHandle.nullDevice
+    p.standardError = FileHandle.nullDevice
+    do { try p.run() } catch { return false }
+    let sem = DispatchSemaphore(value: 0)
+    p.terminationHandler = { _ in sem.signal() }
+    if sem.wait(timeout: .now() + seconds) != .success {
+        p.terminate()
+        return false
+    }
+    return p.terminationStatus == 0
 }
 final class ResultBox { var value = false }
 
@@ -290,9 +313,14 @@ func run(_ exe: String, _ args: [String]) -> Int32 {
 }
 
 func unmountVolume(_ path: String, force: Bool) -> Bool {
-    if unmount(path, force ? MNT_FORCE : 0) == 0 { return true }
     let args = force ? ["unmount", "force", path] : ["unmount", path]
-    return run("/usr/sbin/diskutil", args) == 0
+    if runBounded("/usr/sbin/diskutil", args, seconds: 30) { return true }
+    return findMount(cfg: path) == nil      // already gone?
+}
+
+/// Is anything still mounted at this path?
+func findMount(cfg path: String) -> MountInfo? {
+    currentMounts().first { $0.path == path }
 }
 
 // MARK: - Keychain -------------------------------------------------------------
@@ -441,6 +469,9 @@ final class Agent {
     /// true in `run`/`prompt-token`: a credential rejection may open the dialog
     var interactive = false
     private var promptDeclined = false
+    /// consecutive passes in which the mounted volume did not answer; a
+    /// force-unmount needs two (a cold first pass after launch is not a dead mount)
+    private var staleStrikes = 0
 
     init(_ cfg: Config, interactive: Bool = false) { self.cfg = cfg; self.interactive = interactive }
 
@@ -476,14 +507,22 @@ final class Agent {
         if let m = findMount(cfg) {
             switch probe(m.path, timeout: cfg.probeTimeout) {
             case .some(true):
+                staleStrikes = 0
                 Log.state("healthy:\(m.path)", reason, "mounted and healthy at \(m.path)")
                 armTimer(cfg.pollInterval)
                 return true
             case .some(false):
                 Log.line(reason, "mount at \(m.path) errors on read — remounting")
             case .none:
-                Log.line(reason, "mount at \(m.path) hung \(Int(cfg.probeTimeout))s (stale after sleep?) — force-unmounting")
+                staleStrikes += 1
+                if staleStrikes < 2 {
+                    Log.line(reason, "mount at \(m.path) did not answer in \(Int(cfg.probeTimeout))s — re-checking in 30 s before calling it dead")
+                    armTimer(30)
+                    return false
+                }
+                Log.line(reason, "mount at \(m.path) did not answer twice (stale after sleep?) — force-unmounting")
             }
+            staleStrikes = 0
             if !unmountVolume(m.path, force: true) {
                 Log.line(reason, "force-unmount of \(m.path) failed — will retry next pass")
                 armTimer(30)
