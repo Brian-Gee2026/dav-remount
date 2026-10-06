@@ -28,7 +28,7 @@ import Network
 import IOKit
 import IOKit.pwr_mgt
 
-let VERSION = "0.3.0"
+let VERSION = "0.3.1"
 
 // MARK: - Config -------------------------------------------------------------
 
@@ -387,18 +387,22 @@ func mountShare(_ cfg: Config, token: String) -> MountOutcome {
 /// never logged.
 func promptForToken(_ cfg: Config, reason: String) -> String? {
     let msg = "\(reason)\n\nMint a new access token on your identity server, then paste it here. It is stored in your login Keychain and the share is mounted right away."
+    // Values go in as argv, never into the script source (no AppleScript injection
+    // from a hostile config file).
     let script = """
-    tell application "System Events"
-        activate
-        set r to display dialog "\(msg)" default answer "" with hidden answer buttons {"Later", "Save"} default button "Save" with title "\(cfg.host) — access token" with icon caution giving up after 900
-        if gave up of r then return ""
-        if button returned of r is "Save" then return text returned of r
-        return ""
-    end tell
+    on run argv
+        tell application "System Events"
+            activate
+            set r to display dialog (item 1 of argv) default answer "" with hidden answer buttons {"Later", "Save"} default button "Save" with title (item 2 of argv) with icon caution giving up after 900
+            if gave up of r then return ""
+            if button returned of r is "Save" then return text returned of r
+            return ""
+        end tell
+    end run
     """
     let p = Process()
     p.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-    p.arguments = ["-e", script]
+    p.arguments = ["-e", script, msg, "\(cfg.host) — access token"]
     let out = Pipe()
     p.standardOutput = out
     p.standardError = FileHandle.nullDevice
