@@ -14,7 +14,8 @@
 //   run            long-running agent (what the LaunchAgent starts)
 //   once           mount now if needed, exit 0 when the volume is healthy
 //   status         print config, reachability, token presence, mount state
-//   set-token      store the access token in the Keychain (prompts, no echo)
+//   set-token      store the access token in the Keychain (prompts, no echo) and mount
+//   prompt-token   same, through a native macOS dialog (what the agent shows on a revoke)
 //   forget-token   remove it
 //   has-token      exit 0/1 (for scripts)
 //   unmount [--pause MIN]   eject, optionally pause the agent for MIN minutes
@@ -27,7 +28,7 @@ import Network
 import IOKit
 import IOKit.pwr_mgt
 
-let VERSION = "0.2.0"
+let VERSION = "0.3.0"
 
 // MARK: - Config -------------------------------------------------------------
 
@@ -47,6 +48,9 @@ struct Config {
     /// name means a custom mount point (default ~/Volumes/<name>; ~/Library is refused by macOS).
     var volumeName: String? = nil
     var mountDir: String? = nil
+    /// On a credential rejection the agent asks for a new token in a macOS
+    /// dialog (hidden input) — once per outage; "Later" leaves the CLI path.
+    var promptOnAuthFailure = true
 
     static var dir: String { NSHomeDirectory() + "/.config/dav-remount" }
     /// DAV_REMOUNT_CONFIG overrides the path (tests, second shares).
@@ -97,6 +101,7 @@ struct Config {
             c.volumeName = v
         }
         if let v = kv["mount_dir"], !v.isEmpty { c.mountDir = expand(v) }
+        if let v = kv["prompt_on_auth_failure"] { c.promptOnAuthFailure = !["0", "false", "no"].contains(v.lowercased()) }
         if c.mountDir == nil, let n = c.volumeName { c.mountDir = NSHomeDirectory() + "/Volumes/" + n }
         if let d = c.mountDir, d == "/" || d == NSHomeDirectory() { throw CLIError("config: `mount_dir` must be a dedicated empty directory") }
         return c
@@ -375,6 +380,35 @@ func mountShare(_ cfg: Config, token: String) -> MountOutcome {
     return .failed(rc)
 }
 
+// MARK: - Token dialog (native, hidden input) --------------------------------------
+
+/// Asks for a new access token in a macOS dialog. Returns nil on Later/timeout.
+/// The token travels only through osascript's stdout into this process; it is
+/// never logged.
+func promptForToken(_ cfg: Config, reason: String) -> String? {
+    let msg = "\(reason)\n\nMint a new access token on your identity server, then paste it here. It is stored in your login Keychain and the share is mounted right away."
+    let script = """
+    tell application "System Events"
+        activate
+        set r to display dialog "\(msg)" default answer "" with hidden answer buttons {"Later", "Save"} default button "Save" with title "\(cfg.host) — access token" with icon caution giving up after 900
+        if gave up of r then return ""
+        if button returned of r is "Save" then return text returned of r
+        return ""
+    end tell
+    """
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+    p.arguments = ["-e", script]
+    let out = Pipe()
+    p.standardOutput = out
+    p.standardError = FileHandle.nullDevice
+    do { try p.run() } catch { return nil }
+    let data = out.fileHandleForReading.readDataToEndOfFile()
+    p.waitUntilExit()
+    let t = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    return t.isEmpty ? nil : t
+}
+
 // MARK: - Pause marker -------------------------------------------------------------
 
 enum Pause {
@@ -400,8 +434,11 @@ final class Agent {
     private var timer: DispatchSourceTimer?
     private var rerun = false
     private var running = false
+    /// true in `run`/`prompt-token`: a credential rejection may open the dialog
+    var interactive = false
+    private var promptDeclined = false
 
-    init(_ cfg: Config) { self.cfg = cfg }
+    init(_ cfg: Config, interactive: Bool = false) { self.cfg = cfg; self.interactive = interactive }
 
     /// Coalesce: if an ensure is in flight, run once more when it finishes.
     func schedule(_ reason: String, delay: TimeInterval = 0) {
@@ -463,10 +500,22 @@ final class Agent {
                 case .mounted(let path):
                     Log.line(reason, "mounted \(cfg.host)\(cfg.sharePath) at \(path)")
                     Log.state("healthy:\(path)", reason, "mounted and healthy at \(path)")
+                    promptDeclined = false
                     armTimer(cfg.pollInterval)
                     return true
                 case .authFailed(let rc):
                     Log.state("auth", reason, "server rejected the credential (rc=\(rc)) — token revoked/expired? re-mint and `dav-remount set-token`")
+                    if interactive, cfg.promptOnAuthFailure, !promptDeclined {
+                        Log.line(reason, "asking for a new token in a dialog")
+                        if let t = promptForToken(cfg, reason: "\(cfg.host) rejected the access token for \(cfg.user) (revoked or expired?).") {
+                            let st = Keychain.set(cfg, token: t)
+                            Log.line(reason, st == errSecSuccess ? "new token stored — retrying the mount" : "Keychain refused the new token (\(st))")
+                            if st == errSecSuccess { continue }      // immediate retry, no delay
+                        } else {
+                            promptDeclined = true                     // ask again only after a success
+                            Log.line(reason, "dialog dismissed — will keep trying quietly every 30 s; run `dav-remount set-token` when ready")
+                        }
+                    }
                     armTimer(30)                  // one try per poll, no hot loop
                     return false
                 case .failed(let rc):
@@ -574,7 +623,8 @@ func usage() {
       run                    agent mode (LaunchAgent)
       once                   mount now if needed; exit 0 when healthy
       status                 config, reachability, token, mount state
-      set-token              store the access token in the Keychain (no echo)
+      set-token              store the access token in the Keychain (no echo) and mount
+      prompt-token           same, via a macOS dialog
       forget-token           remove the token
       has-token              exit 0 if a token is stored
       unmount [--pause MIN]  eject; optionally pause the agent for MIN minutes
@@ -601,7 +651,7 @@ func main() -> Int32 {
 
     switch cmd {
     case "run":
-        agent = Agent(cfg)
+        agent = Agent(cfg, interactive: true)
         Log.line("run", "dav-remount \(VERSION) starting — \(cfg.host)\(cfg.sharePath) as \(cfg.user), poll \(Int(cfg.pollInterval))s, unmount_on_sleep=\(cfg.unmountOnSleep)")
         installPowerHooks()
         installNetworkHook()
@@ -640,8 +690,23 @@ func main() -> Int32 {
             out("no token entered"); return 1
         }
         let st = Keychain.set(cfg, token: t.trimmingCharacters(in: .whitespacesAndNewlines))
-        if st == errSecSuccess { out("stored in login Keychain (item: dav-remount (\(cfg.host)))"); return 0 }
-        out("Keychain error \(st): \(SecCopyErrorMessageString(st, nil).map { String($0) } ?? "")"); return 1
+        guard st == errSecSuccess else {
+            out("Keychain error \(st): \(SecCopyErrorMessageString(st, nil).map { String($0) } ?? "")"); return 1
+        }
+        out("stored in login Keychain (item: dav-remount (\(cfg.host))) — mounting")
+        let a = Agent(cfg)
+        let ok = a.ensure("set-token", retry: false)
+        out(ok ? "mounted: \(findMount(cfg)?.path ?? "")" : "stored, but the mount did not come up — see \(cfg.logPath)")
+        return ok ? 0 : 1
+
+    case "prompt-token":
+        guard let t = promptForToken(cfg, reason: "Enter the access token for \(cfg.user) at \(cfg.host).") else { out("cancelled"); return 1 }
+        let st = Keychain.set(cfg, token: t)
+        guard st == errSecSuccess else { out("Keychain error \(st)"); return 1 }
+        let a = Agent(cfg)
+        let ok = a.ensure("prompt-token", retry: false)
+        out(ok ? "stored and mounted: \(findMount(cfg)?.path ?? "")" : "stored, but the mount did not come up — see \(cfg.logPath)")
+        return ok ? 0 : 1
 
     case "forget-token":
         let st = Keychain.forget(cfg)

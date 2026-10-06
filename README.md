@@ -38,7 +38,9 @@ checking that the server is actually reachable (LAN or VPN).
   personal access token (or password) in an internet-password item that only
   this binary is allowed to read. Nothing secret is in the config or the repo.
 - On an auth failure (revoked token) it backs off to one attempt per 30 s and
-  logs once, instead of hammering the server.
+  logs once, instead of hammering the server — and asks for a new token in a
+  native dialog (hidden input), once per outage. Save stores it in the Keychain
+  and remounts immediately; Later leaves it to `dav-remount set-token`.
 - `dav-remount unmount --pause 60` ejects and tells the agent to leave it
   alone for an hour.
 
@@ -69,7 +71,8 @@ Required: `url` (https share URL) and `user`. Everything else has defaults.
 The credential is **never** in the config:
 
 ```sh
-dav-remount set-token      # prompts, no echo; stores in Keychain
+dav-remount set-token      # prompts, no echo; stores in Keychain and mounts right away
+dav-remount prompt-token   # the same through a macOS dialog
 dav-remount forget-token
 ```
 
@@ -94,8 +97,9 @@ launchctl bootout      gui/$(id -u)/dev.dav-remount.agent
 
 - **`unreachable: DNS failed`** — you're not on the LAN/VPN, or your resolver
   isn't the internal one. Nothing is wrong with the agent; it waits.
-- **`server rejected the credential`** — token revoked or expired. Mint a new
-  one and `dav-remount set-token`; the agent picks it up on the next poll.
+- **`server rejected the credential`** — token revoked or expired. The agent
+  opens a dialog for the new token; or mint one and `dav-remount set-token`,
+  which mounts immediately.
 - **A Keychain dialog appears after rebuilding** — the ad-hoc code signature
   changed, so the Keychain asks once whether the new binary may read the item.
   Click Always Allow. Avoid this by installing a release binary rather than

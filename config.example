@@ -32,6 +32,9 @@ user = you@example.com
 #poll_interval = 300
 # Cleanly eject before sleep so there is never a dead mount after wake.
 #unmount_on_sleep = true
+# When the server rejects the token (revoked/expired), ask for a new one in a
+# macOS dialog — once per outage. `dav-remount set-token` always works too.
+#prompt_on_auth_failure = true
 # Seconds a directory listing may take before the mount is declared dead.
 #probe_timeout = 8
 # Log file.
