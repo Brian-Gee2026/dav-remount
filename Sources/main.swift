@@ -28,7 +28,7 @@ import Network
 import IOKit
 import IOKit.pwr_mgt
 
-let VERSION = "0.3.1"
+let VERSION = "0.3.2"
 
 // MARK: - Config -------------------------------------------------------------
 
@@ -389,15 +389,15 @@ func promptForToken(_ cfg: Config, reason: String) -> String? {
     let msg = "\(reason)\n\nMint a new access token on your identity server, then paste it here. It is stored in your login Keychain and the share is mounted right away."
     // Values go in as argv, never into the script source (no AppleScript injection
     // from a hostile config file).
+    // Plain `display dialog` from osascript itself: no `tell application
+    // "System Events"`, which needs a per-app Automation (TCC) grant and
+    // fails with -1743 from a LaunchAgent or a fresh Terminal.
     let script = """
     on run argv
-        tell application "System Events"
-            activate
-            set r to display dialog (item 1 of argv) default answer "" with hidden answer buttons {"Later", "Save"} default button "Save" with title (item 2 of argv) with icon caution giving up after 900
-            if gave up of r then return ""
-            if button returned of r is "Save" then return text returned of r
-            return ""
-        end tell
+        set r to display dialog (item 1 of argv) default answer "" with hidden answer buttons {"Later", "Save"} default button "Save" with title (item 2 of argv) with icon caution giving up after 900
+        if gave up of r then return ""
+        if button returned of r is "Save" then return text returned of r
+        return ""
     end run
     """
     let p = Process()
