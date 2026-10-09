@@ -14,6 +14,8 @@
 //   run            long-running agent (what the LaunchAgent starts)
 //   once           mount now if needed, exit 0 when the volume is healthy
 //   status         print config, reachability, token presence, mount state
+//   config [--terminal|--check]  open the config in a text editor (TextEdit /
+//                  $EDITOR) or just validate it; writes a template when missing
 //   set-token      store the access token in the Keychain (prompts, no echo) and mount
 //   prompt-token   same, through a native macOS dialog (what the agent shows on a revoke)
 //   forget-token   remove it
@@ -28,7 +30,7 @@ import Network
 import IOKit
 import IOKit.pwr_mgt
 
-let VERSION = "0.3.5"
+let VERSION = "0.3.6"
 
 // MARK: - Config -------------------------------------------------------------
 
@@ -80,7 +82,10 @@ struct Config {
         }
         var kv: [String: String] = [:]
         for line in raw.split(separator: "\n") {
+            // TextEdit's smart quotes turn "x" into “x” — read them as plain quotes.
             let t = line.trimmingCharacters(in: .whitespaces)
+                .replacingOccurrences(of: "\u{201C}", with: "\"").replacingOccurrences(of: "\u{201D}", with: "\"")
+                .replacingOccurrences(of: "\u{2018}", with: "'").replacingOccurrences(of: "\u{2019}", with: "'")
             if t.isEmpty || t.hasPrefix("#") { continue }
             guard let eq = t.firstIndex(of: "=") else { continue }
             let k = t[..<eq].trimmingCharacters(in: .whitespaces)
@@ -737,6 +742,9 @@ func usage() {
       run                    agent mode (LaunchAgent)
       once                   mount now if needed; exit 0 when healthy
       status                 config, reachability, token, mount state
+      config                 open the config in your text editor (saved edits apply live)
+      config --terminal      edit it in $EDITOR here, then validate
+      config --check         validate it
       set-token              store the access token in the Keychain (no echo) and mount
       prompt-token           same, via a macOS dialog
       forget-token           remove the token
@@ -770,11 +778,76 @@ func agentStatus() -> String {
     return s
 }
 
+// MARK: - Config editor ------------------------------------------------------------
+
+let CONFIG_TEMPLATE = """
+# dav-remount config — edit and save; the running agent re-reads it within a few seconds.
+# No secrets here: the access token lives in the Keychain (`dav-remount set-token`).
+
+# WebDAV share URL (https). The last path component becomes the volume name.
+url = https://dav.example.com/share
+
+# Username the server expects for HTTP Basic (often your sign-in email).
+user = you@example.com
+
+# Optional (defaults shown) — see config.example in the source for every setting.
+#expect_ip_prefix =
+#retry_window = 120
+#poll_interval = 300
+#unmount_on_sleep = true
+#probe_timeout = 15
+#volume_name =
+
+"""
+
+/// `sh -c '<cmd> "$1"' sh <path>` with the terminal attached (editors need it).
+func runShell(_ cmd: String, _ path: String) -> Int32 {
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: "/bin/sh")
+    p.arguments = ["-c", "\(cmd) \"$1\"", "sh", path]
+    do { try p.run() } catch { return -1 }
+    p.waitUntilExit()
+    return p.terminationStatus
+}
+
+/// Runs before the top-level Config.load, so a broken config can still be opened and fixed.
+func configCommand(_ rest: [String]) -> Int32 {
+    let path = Config.path
+    func check() -> Int32 {
+        do { _ = try Config.load(); out("config OK: \(path)"); return 0 }
+        catch { out("config ERROR: \(error)"); return 1 }
+    }
+    if rest.contains("--check") { return check() }
+    if !FileManager.default.fileExists(atPath: path) {
+        try? FileManager.default.createDirectory(atPath: (path as NSString).deletingLastPathComponent,
+                                                 withIntermediateDirectories: true)
+        guard FileManager.default.createFile(atPath: path, contents: CONFIG_TEMPLATE.data(using: .utf8),
+                                             attributes: [.posixPermissions: 0o600]) else {
+            out("could not create \(path)"); return 1
+        }
+        out("created \(path) from the template — fill in url and user")
+    }
+    let env = ProcessInfo.processInfo.environment
+    if rest.contains("--terminal") {
+        let editor = env["VISUAL"].flatMap { $0.isEmpty ? nil : $0 } ?? env["EDITOR"].flatMap { $0.isEmpty ? nil : $0 } ?? "vi"
+        let rc = runShell(editor, path)
+        if rc != 0 { out("editor exited \(rc)") }
+        return check()
+    }
+    let opener = env["DAV_REMOUNT_OPEN"] ?? "/usr/bin/open -t"
+    let rc = runShell(opener, path)
+    guard rc == 0 else { out("could not open \(path) (\(opener) exited \(rc))"); return 1 }
+    out("opened \(path) in your text editor — save to apply (the agent re-reads it within a few seconds)")
+    out("check it with `dav-remount config --check`, or `dav-remount status` to see the agent pick it up")
+    return 0
+}
+
 func main() -> Int32 {
     let args = Array(CommandLine.arguments.dropFirst())
     guard let cmd = args.first else { usage(); return 2 }
     if cmd == "--version" || cmd == "-V" { out(VERSION); return 0 }
     if cmd == "--help" || cmd == "-h" || cmd == "help" { usage(); return 0 }
+    if cmd == "config" { return configCommand(Array(args.dropFirst())) }
 
     let cfg: Config
     do { cfg = try Config.load() } catch {

@@ -73,6 +73,16 @@ Or download a release binary and run `./install.sh path/to/dav-remount`.
 `~/.config/dav-remount/config` is `key = value`; see `config.example`.
 Required: `url` (https share URL) and `user`. Everything else has defaults.
 
+```sh
+dav-remount config             # open it in your text editor (TextEdit); writes a template if missing
+dav-remount config --terminal  # edit it in $VISUAL / $EDITOR here, then validate
+dav-remount config --check     # validate only
+```
+
+Saved edits apply live — the running agent re-reads the file within a few
+seconds; no restart. `config` opens the file even when it is broken, so you
+can fix it. Curly quotes from TextEdit's smart quotes are read as plain quotes.
+
 The credential is **never** in the config:
 
 ```sh
