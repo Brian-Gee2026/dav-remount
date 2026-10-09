@@ -1,4 +1,5 @@
 # dav-remount config — lives at ~/.config/dav-remount/config
+# The running agent re-reads this file within a few seconds of an edit; no restart needed.
 # No secrets here. The access token goes in the Keychain: `dav-remount set-token`.
 
 # WebDAV share URL (https). The volume in /Volumes is named after the last path
@@ -23,6 +24,9 @@ user = you@example.com
 #reach_timeout = 3
 # If set, the resolved address must start with this prefix, otherwise the agent
 # treats the server as unreachable (catches "VPN down but public DNS answered").
+# Leave it unset if the share is ALSO reachable publicly (split-horizon DNS with a
+# public record): off LAN/VPN the public address is the right answer, and this
+# gate would refuse it.
 #expect_ip_prefix = 10.0.
 
 # ---- behaviour ----------------------------------------------------------------

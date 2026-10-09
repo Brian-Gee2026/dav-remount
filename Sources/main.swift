@@ -28,7 +28,7 @@ import Network
 import IOKit
 import IOKit.pwr_mgt
 
-let VERSION = "0.3.4"
+let VERSION = "0.3.5"
 
 // MARK: - Config -------------------------------------------------------------
 
@@ -56,6 +56,16 @@ struct Config {
     /// DAV_REMOUNT_CONFIG overrides the path (tests, second shares).
     static var path: String { ProcessInfo.processInfo.environment["DAV_REMOUNT_CONFIG"] ?? dir + "/config" }
     static var pausePath: String { dir + "/paused-until" }
+    /// What the running agent last saw — read by `status`. Sits beside the
+    /// config so a DAV_REMOUNT_CONFIG test never touches the real one.
+    static var statePath: String { path + ".state" }
+
+    /// mtime+size of the config file; a change means "re-read it".
+    static func stamp(_ p: String = Config.path) -> String? {
+        guard let a = try? FileManager.default.attributesOfItem(atPath: p),
+              let m = a[.modificationDate] as? Date else { return nil }
+        return "\(m.timeIntervalSince1970)-\((a[.size] as? Int) ?? 0)"
+    }
 
     var host: String { url.host ?? "" }
     var sharePath: String { url.path.isEmpty ? "/" : url.path }
@@ -145,6 +155,10 @@ final class Log {
         if changed { line(tag, msg) }
     }
 
+    /// Forget the last state so the next pass logs its result again (after a
+    /// config reload, "still unreachable" is news: it is the new config's answer).
+    static func resetState() { q.sync { lastKey = "" } }
+
     private static func rotateIfNeeded() {
         guard let a = try? FileManager.default.attributesOfItem(atPath: path),
               let size = a[.size] as? Int, size > 2_000_000 else { return }
@@ -166,7 +180,7 @@ enum Reach {
         switch self {
         case .ok(let ip): return "reachable (\(ip))"
         case .dnsFailed(let e): return "unreachable: DNS failed (\(e)) — not on LAN/VPN, or internal DNS not in use"
-        case .unexpectedIP(let ip): return "unreachable: \(ip) is not an internal address — VPN down or split-horizon DNS not active"
+        case .unexpectedIP(let ip): return "unreachable: \(ip) is not an internal address (expect_ip_prefix) — VPN down or split-horizon DNS not active; leave expect_ip_prefix unset if the share is also reachable publicly"
         case .tcpFailed(let ip, let e): return "unreachable: tcp connect to \(ip) failed (\(e)) — VPN/LAN down?"
         }
     }
@@ -461,7 +475,14 @@ enum Pause {
 // MARK: - Agent --------------------------------------------------------------------
 
 final class Agent {
-    let cfg: Config
+    /// Re-read when the config file changes (watchConfig + each pass), so an
+    /// edit takes effect without restarting the LaunchAgent (eng#320).
+    private(set) var cfg: Config
+    private var cfgStamp: String?
+    private var cfgTimer: DispatchSourceTimer?
+    /// `run` only: write Config.statePath after each pass for `status`.
+    var recordsState = false
+    private var lastNote = ""
     let q = DispatchQueue(label: "dav-remount.agent")
     private var timer: DispatchSourceTimer?
     private var rerun = false
@@ -473,7 +494,44 @@ final class Agent {
     /// force-unmount needs two (a cold first pass after launch is not a dead mount)
     private var staleStrikes = 0
 
-    init(_ cfg: Config, interactive: Bool = false) { self.cfg = cfg; self.interactive = interactive }
+    init(_ cfg: Config, interactive: Bool = false) {
+        self.cfg = cfg; self.interactive = interactive; cfgStamp = Config.stamp()
+    }
+
+    /// Swap in the edited config. A broken edit keeps the running one and is
+    /// logged once per change of the file.
+    private func reloadIfChanged(_ reason: String) {
+        let st = Config.stamp()
+        guard st != cfgStamp else { return }
+        cfgStamp = st
+        do {
+            let c = try Config.load()
+            cfg = c
+            Log.path = c.logPath
+            Log.resetState()
+            Log.line("config", "reloaded — \(c.host)\(c.sharePath) as \(c.user), expect_ip_prefix=\(c.expectIPPrefix ?? "unset"), poll \(Int(c.pollInterval))s")
+        } catch {
+            Log.line("config", "config reload failed (\(error)) — still running on the previous config")
+        }
+    }
+
+    /// Notice config edits between passes (cheap stat every few seconds).
+    func watchConfig(every s: TimeInterval = 5) {
+        let t = DispatchSource.makeTimerSource(queue: q)
+        t.schedule(deadline: .now() + s, repeating: s)
+        t.setEventHandler { [weak self] in
+            guard let self = self, Config.stamp() != self.cfgStamp else { return }
+            self.schedule("config")
+        }
+        t.resume()
+        cfgTimer = t
+    }
+
+    private func writeState(_ result: String) {
+        let f = ISO8601DateFormatter(); f.timeZone = .current
+        let body = "pid = \(getpid())\nupdated = \(f.string(from: Date()))\nconfig_stamp = \(cfgStamp ?? "-")\nresult = \(result)\n"
+        try? body.write(toFile: Config.statePath, atomically: true, encoding: .utf8)
+    }
 
     /// Coalesce: if an ensure is in flight, run once more when it finishes.
     func schedule(_ reason: String, delay: TimeInterval = 0) {
@@ -491,7 +549,16 @@ final class Agent {
     /// volume is mounted and alive at the end.
     @discardableResult
     func ensure(_ reason: String, retry: Bool = true) -> Bool {
+        reloadIfChanged(reason)
+        lastNote = "not mounted"
+        let ok = pass(reason, retry: retry)
+        if recordsState { writeState(ok ? "mounted and healthy at \(findMount(cfg)?.path ?? "?")" : lastNote) }
+        return ok
+    }
+
+    private func pass(_ reason: String, retry: Bool) -> Bool {
         if let p = Pause.until() {
+            lastNote = "paused until \(p)"
             Log.state("paused", reason, "paused until \(p) — skipping")
             armTimer(30)
             return false
@@ -532,6 +599,7 @@ final class Agent {
         let start = Date()
         var delays: [TimeInterval] = [0, 3, 5, 10, 20, 30, 30, 30, 30]
         while true {
+            reloadIfChanged(reason)               // an edit mid-retry applies now
             let r = checkReach(cfg)
             if r.isOK {
                 guard let token = Keychain.read(cfg) else {
@@ -547,6 +615,7 @@ final class Agent {
                     armTimer(cfg.pollInterval)
                     return true
                 case .authFailed(let rc):
+                    lastNote = "server rejected the credential (rc=\(rc))"
                     Log.state("auth", reason, "server rejected the credential (rc=\(rc)) — token revoked/expired? re-mint and `dav-remount set-token`")
                     if interactive, cfg.promptOnAuthFailure, !promptDeclined {
                         Log.line(reason, "asking for a new token in a dialog")
@@ -562,9 +631,11 @@ final class Agent {
                     armTimer(30)                  // one try per poll, no hot loop
                     return false
                 case .failed(let rc):
+                    lastNote = "mount failed rc=\(rc)"
                     Log.line(reason, "mount failed rc=\(rc) (\(String(cString: strerror(rc))))")
                 }
             } else {
+                lastNote = r.text
                 Log.state("unreach", reason, r.text)
             }
             guard retry, !delays.isEmpty, Date().timeIntervalSince(start) < cfg.retryWindow else { break }
@@ -678,6 +749,27 @@ func usage() {
     """)
 }
 
+/// The running agent's own view (its last pass), so `status` cannot claim
+/// "reachable" while the agent is refusing on a config it loaded earlier.
+func agentStatus() -> String {
+    guard let raw = try? String(contentsOfFile: Config.statePath, encoding: .utf8) else {
+        return "no state yet (agent not running, or older than 0.3.5)"
+    }
+    var kv: [String: String] = [:]
+    for l in raw.split(separator: "\n") {
+        guard let eq = l.firstIndex(of: "=") else { continue }
+        kv[l[..<eq].trimmingCharacters(in: .whitespaces)] = l[l.index(after: eq)...].trimmingCharacters(in: .whitespaces)
+    }
+    let pid = Int32(kv["pid"] ?? "") ?? 0
+    let alive = pid > 0 && kill(pid, 0) == 0
+    var s = alive ? "pid \(pid), last pass \(kv["updated"] ?? "?"): \(kv["result"] ?? "?")"
+                  : "not running (last seen pid \(pid) at \(kv["updated"] ?? "?"))"
+    if alive, kv["config_stamp"] != Config.stamp() {
+        s += "\n           WARNING: the agent is on an older config than the file — it re-reads it within a few seconds"
+    }
+    return s
+}
+
 func main() -> Int32 {
     let args = Array(CommandLine.arguments.dropFirst())
     guard let cmd = args.first else { usage(); return 2 }
@@ -695,11 +787,13 @@ func main() -> Int32 {
     switch cmd {
     case "run":
         agent = Agent(cfg, interactive: true)
+        agent.recordsState = true
         Log.line("run", "dav-remount \(VERSION) starting — \(cfg.host)\(cfg.sharePath) as \(cfg.user), poll \(Int(cfg.pollInterval))s, unmount_on_sleep=\(cfg.unmountOnSleep)")
         installPowerHooks()
         installNetworkHook()
         signal(SIGTERM) { _ in Log.line("run", "SIGTERM — exiting (mount left as is)"); exit(0) }
         agent.schedule("startup")
+        agent.watchConfig()
         CFRunLoopRun()
         return 0
 
@@ -724,6 +818,7 @@ func main() -> Int32 {
         } else {
             out("mount:     not mounted")
         }
+        out("agent:     \(agentStatus())")
         out("log:       \(cfg.logPath)")
         return 0
 

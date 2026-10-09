@@ -31,7 +31,12 @@ checking that the server is actually reachable (LAN or VPN).
 - **Reachability gate:** resolves the host and makes a TCP connect to it with
   a short timeout. Off VPN / off LAN it logs `unreachable` and does nothing.
   Optionally insists the address is internal (`expect_ip_prefix`) to catch a
-  VPN that's down while public DNS still answers.
+  VPN that's down while public DNS still answers. Leave it unset when the share
+  is also published publicly — then the public address is a valid answer.
+- **Config edits apply live.** The agent re-reads the config within a few
+  seconds of a change (a broken edit is logged and the old config kept), and
+  `dav-remount status` shows the agent's own last pass (`agent:`), with a
+  warning if it is still on an older config than the file.
 - **Mounts with Apple's own NetFS API** (what Finder uses), with UI
   suppressed, so no dialog can ever pop up.
 - **Credential from the login Keychain.** `dav-remount set-token` stores your
