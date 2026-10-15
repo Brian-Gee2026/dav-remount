@@ -30,7 +30,7 @@ import Network
 import IOKit
 import IOKit.pwr_mgt
 
-let VERSION = "0.3.6"
+let VERSION = "0.3.7"
 
 // MARK: - Config -------------------------------------------------------------
 
@@ -332,9 +332,21 @@ func run(_ exe: String, _ args: [String]) -> Int32 {
 }
 
 func unmountVolume(_ path: String, force: Bool) -> Bool {
-    let args = force ? ["unmount", "force", path] : ["unmount", path]
-    if runBounded("/usr/sbin/diskutil", args, seconds: 30) { return true }
-    return findMount(cfg: path) == nil      // already gone?
+    if !force {
+        if runBounded("/usr/sbin/diskutil", ["unmount", path], seconds: 30) { return true }
+        return findMount(cfg: path) == nil  // already gone?
+    }
+    // eng#323: `diskutil unmount force` alone failed on hung webdavfs mounts
+    // after wake, leaving a dead mount for a whole extra pass. Escalate to the
+    // kernel's forced unmount (the mount is the user's own, so no root needed).
+    let chain: [(String, [String], TimeInterval)] = [
+        ("/usr/sbin/diskutil", ["unmount", "force", path], 30),
+        ("/sbin/umount", ["-f", path], 15),
+    ]
+    for (exe, args, seconds) in chain {
+        if runBounded(exe, args, seconds: seconds) || findMount(cfg: path) == nil { return true }
+    }
+    return false
 }
 
 /// Is anything still mounted at this path?
@@ -498,6 +510,7 @@ final class Agent {
     /// consecutive passes in which the mounted volume did not answer; a
     /// force-unmount needs two (a cold first pass after launch is not a dead mount)
     private var staleStrikes = 0
+    private var unmountFailures = 0
 
     init(_ cfg: Config, interactive: Bool = false) {
         self.cfg = cfg; self.interactive = interactive; cfgStamp = Config.stamp()
@@ -580,6 +593,7 @@ final class Agent {
             switch probe(m.path, timeout: cfg.probeTimeout) {
             case .some(true):
                 staleStrikes = 0
+                unmountFailures = 0
                 Log.state("healthy:\(m.path)", reason, "mounted and healthy at \(m.path)")
                 armTimer(cfg.pollInterval)
                 return true
@@ -594,12 +608,19 @@ final class Agent {
                 }
                 Log.line(reason, "mount at \(m.path) did not answer twice (stale after sleep?) — force-unmounting")
             }
-            staleStrikes = 0
             if !unmountVolume(m.path, force: true) {
-                Log.line(reason, "force-unmount of \(m.path) failed — will retry next pass")
-                armTimer(30)
+                // eng#323: keep staleStrikes armed so the next pass unmounts
+                // again at once instead of probing twice more, and come back
+                // in 5 s the first time rather than a full 30 s pass.
+                unmountFailures += 1
+                staleStrikes = max(staleStrikes, 2)   // the mount is known bad
+                let next: TimeInterval = unmountFailures == 1 ? 5 : 30
+                Log.line(reason, "force-unmount of \(m.path) failed (diskutil, then umount -f) — retrying in \(Int(next)) s")
+                armTimer(next)
                 return false
             }
+            staleStrikes = 0
+            unmountFailures = 0
         }
         let start = Date()
         var delays: [TimeInterval] = [0, 3, 5, 10, 20, 30, 30, 30, 30]

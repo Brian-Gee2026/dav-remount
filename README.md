@@ -27,7 +27,8 @@ checking that the server is actually reachable (LAN or VPN).
   while mounted, every 30 s while not).
 - **Ejects cleanly before sleep** so there is never a dead mount after wake.
   If something kept the volume busy, a hung listing after wake is detected
-  and the mount is forced off and redone.
+  and the mount is forced off and redone (`diskutil unmount force`, then
+  `umount -f` if that fails; a failed force-unmount retries in 5 s).
 - **Reachability gate:** resolves the host and makes a TCP connect to it with
   a short timeout. Off VPN / off LAN it logs `unreachable` and does nothing.
   Optionally insists the address is internal (`expect_ip_prefix`) to catch a
